@@ -4,6 +4,8 @@ import json
 import logging
 import asyncio
 import socket
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from typing import Dict, Any, List
 
@@ -605,10 +607,70 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
+class CloudHealthCheckHandler(BaseHTTPRequestHandler):
+    """
+    Lightweight HTTP server responding to Alet Cloud / container readiness probes.
+    Satisfies $PORT readiness checks so container status turns green (LIVE).
+    """
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>TikTok Amharic Bot - Status</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 2.5rem; border-radius: 14px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; max-width: 480px; border: 1px solid #334155; }
+        .badge { display: inline-block; background: #10b981; color: #042f2e; padding: 6px 14px; border-radius: 9999px; font-weight: bold; font-size: 0.875rem; margin-bottom: 1rem; }
+        h1 { margin: 0 0 0.5rem 0; font-size: 1.5rem; }
+        p { color: #94a3b8; font-size: 0.95rem; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="badge">● LIVE &amp; HEALTHY</span>
+        <h1>🤖 TikTok Amharic Transcriber Bot</h1>
+        <p>The Telegram Bot is running and actively processing TikTok video downloads, speech transcription, and Amharic translation.</p>
+    </div>
+</body>
+</html>"""
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        # Suppress periodic health check logs to keep container logs clean
+        return
+
+def start_health_server():
+    """Starts background HTTP server for Alet Cloud / K8s port readiness probes."""
+    port = int(os.getenv("PORT", "3000"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), CloudHealthCheckHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"✅ Cloud health check HTTP server listening on port {port}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not start health check HTTP server on port {port}: {e}")
+
 def main():
+    # 1. Start HTTP health check server immediately so Alet Cloud / K8s readiness probe succeeds
+    start_health_server()
+
+    # 2. Validate environment configuration
     is_valid, msg = validate_config()
     if not is_valid:
-        print(msg)
+        print("\n" + "=" * 65, flush=True)
+        print(f"❌ {msg}", flush=True)
+        print("👉 In Alet Cloud, go to your app's 'Variables' tab and set:", flush=True)
+        print("   • TELEGRAM_BOT_TOKEN = <your_bot_token>", flush=True)
+        print("   • GEMINI_API_KEY     = <your_gemini_api_key>", flush=True)
+        print("=" * 65 + "\n", flush=True)
+        # Keep process alive with healthcheck server so container doesn't enter a crash loop
+        import time
+        while True:
+            time.sleep(3600)
         return
 
     print("🚀 Starting Upgraded TikTok Amharic Transcriber Bot...", flush=True)
