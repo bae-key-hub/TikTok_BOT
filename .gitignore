@@ -1,0 +1,60 @@
+# ==========================================
+# 🐍 Python Bytecode & Cache
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# 📦 Virtual Environments
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# 🔑 Secrets & Local Environment Configs
+# ==========================================
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# 🎬 Downloaded Media & Temporary Audio
+# ==========================================
+downloads/*
+!downloads/.gitkeep
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.part
+*.ytdl
+
+# ==========================================
+# 🪵 Logs & Session Dumps
+# ==========================================
+*.log
+*.sqlite
+*.db
+batch_*.json
+
+# ==========================================
+# 💻 Operating System & IDE Files
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
