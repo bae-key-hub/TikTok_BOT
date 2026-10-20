@@ -11,6 +11,9 @@ def extract_audio_from_video(video_path: str) -> str:
     if not os.path.exists(video_path):
         return video_path
 
+    if video_path.lower().endswith(".mp3"):
+        return video_path
+
     base_name, _ = os.path.splitext(video_path)
     audio_path = f"{base_name}_audio.mp3"
 

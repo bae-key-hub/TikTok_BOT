@@ -48,12 +48,15 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN, validate_config
 from tiktok_downloader import (
     is_tiktok_url,
+    extract_video_id,
+    extract_all_video_ids,
     parse_any_query,
     resolve_creator_from_url,
     get_user_video_urls,
+    download_tiktok_audio_and_meta,
     download_tiktok_video
 )
-from audio_utils import extract_audio_from_video, cleanup_files
+from audio_utils import cleanup_files
 from transcriber import transcribe_and_translate_to_amharic
 
 logging.basicConfig(
@@ -123,10 +126,13 @@ def build_report_message(data: Dict[str, Any]) -> str:
     if sound_vibe:
         music_details += f"\n• **የድምፅ ባህሪ (Vibe):** {sound_vibe}"
 
+    id_line = f"• 🆔 **መታወቂያ (Video ID):** `{data.get('video_id')}`\n" if data.get('video_id') else ""
+
     return (
         "🎬 **የቲክቶክ ዝርዝር መረጃ (TikTok Video Info)**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 **አዘጋጅ (Creator):** {data.get('creator')} ({data.get('creator_handle')})\n"
+        f"{id_line}"
         f"⏱️ **ርዝመት (Duration):** {data.get('duration_seconds')} ሰከንድ\n"
         f"❤️ **መውደዶች:** {stats.get('likes', 0):,} | 👁️ **ዕይታዎች:** {stats.get('views', 0):,}\n\n"
         "📝 **የመጀመሪያው ጽሑፍ (Original Caption):**\n"
@@ -156,7 +162,7 @@ async def process_single_video(
     video_number: int = 1,
     total_videos: int = 1
 ) -> Dict[str, Any]:
-    """Downloads, transcribes to Amharic, and sends video, audio, and report."""
+    """Downloads audio track and metadata, transcribes to Amharic, and sends audio and report (No video files)."""
     loop = asyncio.get_running_loop()
     chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat.id
     user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else 0)
@@ -164,29 +170,28 @@ async def process_single_video(
 
     progress_prefix = f"({video_number}/{total_videos}) " if total_videos > 1 else ""
 
-    # Step 1: Download
+    # Step 1: Download audio track & metadata only (NO video file)
     await status_msg.edit_text(
-        f"⏳ **{progress_prefix}ደረጃ 1/3:** ቪዲዮውን በማውረድ ላይ...\n*(Downloading video & metadata...)*",
+        f"⏳ **{progress_prefix}ደረጃ 1/3:** ድምፁን እና መረጃውን በማውረድ ላይ...\n*(Downloading audio track & metadata...)*",
         parse_mode="Markdown"
     )
 
-    download_result = await loop.run_in_executor(None, download_tiktok_video, url)
+    download_result = await loop.run_in_executor(None, download_tiktok_audio_and_meta, url)
     if not download_result.get("success"):
         err = download_result.get("error", "Unknown error")
-        raise Exception(f"ቪዲዮውን ማውረድ አልተቻለም: {err}")
+        raise Exception(f"ድምፁን ወይም መረጃውን ማውረድ አልተቻለም: {err}")
 
-    video_path = download_result["video_path"]
-    audio_path = None
+    audio_path = download_result.get("audio_path")
+    if not audio_path or not os.path.exists(audio_path):
+        raise Exception("የድምፅ ፋይሉ አልተገኘም (Audio file not found)")
 
     try:
-        # Step 2: Extract audio and transcribe with Gemini
+        # Step 2: Transcribe with Gemini AI
         await status_msg.edit_text(
             f"🎧 **{progress_prefix}ደረጃ 2/3:** ድምፁን እና ጽሑፉን ወደ አማርኛ በመተርጎም ላይ...\n"
             "*(Gemini AI is translating speech & caption to Amharic...)*",
             parse_mode="Markdown"
         )
-
-        audio_path = await loop.run_in_executor(None, extract_audio_from_video, video_path)
 
         ai_result = await loop.run_in_executor(
             None,
@@ -206,8 +211,10 @@ async def process_single_video(
         }
 
         # Step 3: Package structured data
+        vid = download_result.get("video_id") or extract_video_id(url)
         structured_data = {
             "tiktok_url": url,
+            "video_id": vid or "",
             "creator": download_result.get("uploader", "Unknown"),
             "creator_handle": download_result.get("uploader_handle", ""),
             "duration_seconds": download_result.get("duration", 0),
@@ -221,23 +228,13 @@ async def process_single_video(
         session_id = f"{user_id}_{uuid_str()}"
         SESSION_DATA[session_id] = structured_data
 
-        # Step 4: Send Video, Audio, and Card
+        # Step 4: Send Audio Track and Report Card (NO VIDEO FILE DOWNLOADED OR SENT)
         await status_msg.edit_text(
-            f"📤 **{progress_prefix}ደረጃ 3/3:** ቪዲዮውን እና ድምፁን በመላክ ላይ...\n*(Sending video & audio files...)*",
+            f"📤 **{progress_prefix}ደረጃ 3/3:** ድምፁን እና ዝርዝር መረጃውን በመላክ ላይ...\n*(Sending audio track & report...)*",
             parse_mode="Markdown"
         )
 
-        # 1. Send Video file (if under 50MB)
-        if os.path.exists(video_path) and os.path.getsize(video_path) < 50 * 1024 * 1024:
-            with open(video_path, "rb") as vf:
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=vf,
-                    caption=f"🎥 {structured_data['creator']} - TikTok Video",
-                    supports_streaming=True
-                )
-
-        # 2. Send Standalone Audio file (.mp3)
+        # 1. Send Standalone Audio file (.mp3)
         if audio_path and os.path.exists(audio_path) and audio_path.endswith(".mp3"):
             music_meta = structured_data.get("music", {})
             with open(audio_path, "rb") as af:
@@ -250,7 +247,7 @@ async def process_single_video(
                     parse_mode="Markdown"
                 )
 
-        # 3. Send Formatted Info Card
+        # 2. Send Formatted Info Card
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📦 ሙሉ JSON ዳታ አውርድ (Get Raw JSON)", callback_data=f"json_{session_id}")]
         ])
@@ -266,7 +263,7 @@ async def process_single_video(
         return structured_data
 
     finally:
-        cleanup_files(video_path, audio_path)
+        cleanup_files(audio_path)
 
 def uuid_str() -> str:
     import uuid
@@ -299,33 +296,139 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **ሰላም! እንኳን ወደ ቲክቶክ ወደ አማርኛ ተርጓሚ ቦት በደህና መጡ!**\n"
         "*(Welcome to the Upgraded TikTok Amharic Transcriber Bot!)*\n\n"
         "✨ **አዳዲስ ልዩ ችሎታዎች (New Features):**\n"
-        "1️⃣ **በቪዲዮ ሊንክ (Video Link):** ማንኛውንም የቲክቶክ ሊንክ ይላኩ — 1 ቪዲዮ ብቻ ወይም የፈጣሪውን በርካታ ቪዲዮዎች መርጠው ማውረድ ይችላሉ!\n"
-        "2️⃣ **በተጠቃሚ ስም (By Username):** የፈጣሪውን ስም ይላኩ (ለምሳሌ: `@adonaymada` ወይም `@adonaymada 10`)\n"
-        "3️⃣ **የሚፈልጉትን የቪዲዮ ብዛት በነጻነት ይጻፉ (Custom Number):** ቁጥሩን በፈለጉት መጠን (ለምሳሌ: `4`፣ `7`፣ `10`፣ `15`...) ጽፈው መላክ ይችላሉ!\n"
-        "4️⃣ **መግለጫውን ይተረጉማል (Translates Caption):** የመጀመሪያውን ጽሑፍ እና የአማርኛ ትርጉሙን ያቀርባል።\n"
-        "5️⃣ **ድምፁን ለብቻ ይልካል (Audio by Itself):** እንደ ዘፈን ወይም ፖድካስት ማዳመጥ ይችላሉ።\n"
-        "6️⃣ **የጀርባ ሙዚቃን ይለያል (Detects Background Music):** ትሬንዲንግ ድምፅ ወይም ዘፈኑን ይለያል።\n\n"
-        "🚀 **ለመጀመር:** የቲክቶክ ቪዲዮ ሊንክ ወይም የተጠቃሚ ስም ይላኩልኝ!"
+        "1️⃣ **ያልተገደበ የቪዲዮ መታወቂያዎች ዝርዝር (Unlimited Video IDs List):**\n"
+        "   - በርካታ የቪዲዮ መታወቂያዎችን (Video IDs) በአንድ ጊዜ ጽፈው ወይም paste አድርገው መላክ ይችላሉ!\n"
+        "   - ቦቱ እያንዳንዱን በቅደም ተከተል ያዘጋጃል፤ ምንም የቁጥር ገደብ የለም (Unlimited)!\n"
+        "2️⃣ **በነጠላ ቪዲዮ መታወቂያ ወይም ሊንክ (Single Video ID or Link):**\n"
+        "   - አንድ Video ID (ለምሳሌ `7698794225453813022`) ወይም ሊንክ በቀጥታ ይላኩ።\n"
+        "3️⃣ **ድምፅ እና መረጃ ብቻ (Audio, Caption & Transcription Only - No Video!):**\n"
+        "   - ቪዲዮውን ሳያወርዱ የድምፅ ትራኩን (.mp3)፣ የመጀመሪያውን መግለጫ እና የአማርኛ ትርጉሙን፣ እንዲሁም ሙሉ የንግግር ግልባጩንና ማጠቃለያውን ያገኛሉ።\n"
+        "4️⃣ **የጀርባ ሙዚቃ እና ቫይብ መለያ (Trending Music & Vibe Detection):**\n"
+        "   - በጀርባ የተጠቀሙበትን ትሬንዲንግ ሙዚቃ ወይም ድምፅ ለይቶ ባህሪውን (Vibe) ያብራራል።\n"
+        "5️⃣ **በተጠቃሚ ስም (By Username):** የፈጣሪውን ስም ይላኩ (ለምሳሌ: `@adonaymada` ወይም `@adonaymada 10`)\n\n"
+        "🚀 **ለመጀመር:** የቪዲዮ መታወቂያ (ወይም የበርካታ Video IDs ዝርዝር)፣ የቲክቶክ ሊንክ ወይም የተጠቃሚ ስም ይላኩልኝ!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "ℹ️ **የአጠቃቀም መመሪያ (How to Use):**\n\n"
+        "• **ያልተገደበ የቪዲዮ መታወቂያዎች ዝርዝር (Unlimited Video IDs List):**\n"
+        "  - በርካታ የቪዲዮ ቁጥሮችን በየመስመሩ ወይም በነጠላ ሰረዝ ለይተው ይላኩ፦\n"
+        "    `7698794225453813022`\n"
+        "    `7698794225453813023`\n"
+        "    `7698794225453813024`\n"
+        "  - ቦቱ ሁሉንም በቅደም ተከተል ድምፃቸውን እና መረጃቸውን አዘጋጅቶ ያቀርባል!\n\n"
+        "• **በአንድ ቪዲዮ መታወቂያ (Single Video ID):**\n"
+        "  - የቪዲዮውን ቁጥር በቀጥታ ይላኩ (ለምሳሌ: `7698794225453813022`)\n"
+        "  - ወይም በትእዛዝ: `/video 7698794225453813022`\n\n"
         "• **ቪዲዮ በሊንክ (Single Video or Creator Batch):**\n"
         "  - `https://www.tiktok.com/@user/video/...` ይላኩ\n"
         "  - ወይም `https://vm.tiktok.com/... 5` ብለው የቪዲዮውን ብዛት ጨምረው መላክ ይችላሉ!\n\n"
         "• **በርካታ ቪዲዮዎች በተጠቃሚ ስም (By Creator Username):**\n"
-        "  - `@username` ይላኩ -> ስንት ቪዲዮ እንደሚፈልጉ የሚመርጡበት አዝራር ይመጣል፣ ወይም የሚፈልጉትን ቁጥር (ለምሳሌ: `4` ወይም `10`) ጽፈው መላክ ይችላሉ!\n"
-        "  - ወይም በቀጥታ `@username 5` በማለት ማግኘት ይችላሉ።"
+        "  - `@username` ወይም `@username 5` ብለው ይላኩ።"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles single video links, creator usernames, and custom numeric counts."""
-    text = update.message.text.strip()
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /video <id_or_url> or /id <id_or_url> commands."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "💡 **እባክዎ የቪዲዮውን መታወቂያ (Video ID) ወይም ሊንክ አብረው ይጻፉ!**\n"
+            "*(Please provide a TikTok Video ID or URL!)*\n\n"
+            "ምሳሌ (Examples):\n"
+            "• `/video 7698794225453813022`\n"
+            "• `/video 7698794225453813022 5`\n"
+            "• `/id 7698794225453813022`\n\n"
+            "ወይም በቀጥታ ቁጥሩን ብቻ በቻቱ ጽፈው መላክ ይችላሉ!",
+            parse_mode="Markdown"
+        )
+        return
+    await handle_user_message(update, context, override_text=" ".join(args))
+
+async def start_batch_processing_video_ids(update: Update, context: ContextTypes.DEFAULT_TYPE, video_ids: List[str]):
+    """
+    Processes an arbitrary list of TikTok Video IDs (unlimited).
+    Downloads audio and metadata for each ID sequentially without downloading video files.
+    """
+    chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat.id
+    user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else 0)
+    bot = context.bot
+
+    # Clear pending session state
+    context.user_data.pop("pending_creator", None)
+    context.user_data.pop("pending_video", None)
+
+    total = len(video_ids)
+    status_text = (
+        f"📋 **የ {total} ቪዲዮ መታወቂያዎች ዝርዝር ደርሶናል! (List of {total} Video IDs Received)**\n"
+        f"⏳ እያንዳንዱን ድምፅ፣ መግለጫ እና የትርጉም መረጃ በማዘጋጀት ላይ...\n"
+        f"*(Processing {total} TikTok videos sequentially...)*"
+    )
+    if update.callback_query and update.callback_query.message:
+        status_msg = await update.callback_query.message.reply_text(status_text, parse_mode="Markdown")
+    else:
+        status_msg = await update.message.reply_text(status_text, parse_mode="Markdown")
+
+    all_results = []
+
+    for idx, vid in enumerate(video_ids, start=1):
+        v_url = f"https://www.tiktok.com/@tiktok/video/{vid}"
+        try:
+            res = await process_single_video(
+                url=v_url,
+                update=update,
+                context=context,
+                status_msg=status_msg,
+                video_number=idx,
+                total_videos=total
+            )
+            all_results.append(res)
+        except Exception as e:
+            logger.error(f"Error processing video ID {vid} ({idx}/{total}): {e}")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ ቪዲዮ {idx} (ID: `{vid}`) ማዘጋጀት አልተቻለም ({str(e)[:100]})",
+                parse_mode="Markdown"
+            )
+
+    # Master bundle button
+    batch_session_id = f"batch_{user_id}_{uuid_str()}"
+    SESSION_DATA[batch_session_id] = {
+        "batch_type": "video_id_list",
+        "creator": "video_ids_list",
+        "total_requested": total,
+        "total_processed": len(all_results),
+        "video_ids": video_ids,
+        "videos": all_results
+    }
+
+    master_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 የተሟላ Master JSON ባች አውርድ (Download Master JSON)", callback_data=f"master_{batch_session_id}")]
+    ])
+
+    await status_msg.edit_text(
+        f"🎉 **ተጠናቋል!** ከ **{total}** ቪዲዮዎች ውስጥ **{len(all_results)}** በተሳካ ሁኔታ ተጠናቀዋል!\n"
+        f"*(Successfully finished {len(all_results)} of {total} video IDs!)*",
+        parse_mode="Markdown",
+        reply_markup=master_keyboard
+    )
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = None):
+    """Handles single video links, video IDs, lists of unlimited video IDs, creator usernames, and custom numeric counts."""
+    text = (override_text or (update.message.text if update.message else "")).strip()
+    if not text:
+        return
     query_info = parse_any_query(text)
     q_type = query_info.get("type")
+
+    # CASE 0: User pasted a list of multiple Video IDs (unlimited)
+    if q_type == "video_id_list":
+        video_ids = query_info.get("video_ids", [])
+        if video_ids:
+            await start_batch_processing_video_ids(update, context, video_ids)
+            return
 
     # CASE 1: User typed a pure number (e.g. "4", "7", "10", "15")
     if q_type == "number":
@@ -351,22 +454,49 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
         else:
             await update.message.reply_text(
-                "⚠️ እባክዎ መጀመሪያ የቲክቶክ ቪዲዮ ሊንክ ወይም የተጠቃሚ ስም ይላኩ!\n"
-                "*(Please send a TikTok video link or @username first!)*\n\n"
+                "⚠️ እባክዎ መጀመሪያ የቲክቶክ ቪዲዮ ሊንክ፣ Video ID ወይም የተጠቃሚ ስም ይላኩ!\n"
+                "*(Please send a TikTok video link, video ID, or @username first!)*\n\n"
                 "ምሳሌ (Examples):\n"
+                "• `7698794225453813022` (የቪዲዮ መታወቂያ / Video ID)\n"
+                "• `7698794225453813022, 7698794225453813023` (ያልተገደበ የቪዲዮ ዝርዝር / Unlimited list of Video IDs)\n"
                 "• `https://vm.tiktok.com/...`\n"
                 "• `https://www.tiktok.com/@user/video/...`\n"
                 "• `@adonaymada` ወይም `@adonaymada 5`"
             )
             return
 
-    # CASE 2: User sent a TikTok video link
+    # CASE 2: Single TikTok Video ID
+    if q_type == "video_id":
+        url = query_info["url"]
+        count = query_info.get("count")
+        creator = query_info.get("creator")
+        vid = query_info.get("video_id")
+
+        # If user explicitly appended a creator count > 1 (e.g. "<id> 5")
+        if count is not None and count > 1:
+            target_creator = creator or "creator"
+            await start_batch_processing(update, context, target_creator, count)
+            return
+
+        # Direct processing for single video ID (or if count == 1)
+        status_msg = await update.message.reply_text(
+            f"⏳ የቪዲዮ መታወቂያ `{vid}` በመቀበል ላይ...\n*(Processing TikTok Video ID: {vid}...)*",
+            parse_mode="Markdown"
+        )
+        try:
+            await process_single_video(url, update, context, status_msg)
+            await status_msg.delete()
+        except Exception as e:
+            logger.error(f"Error processing video ID {vid}: {e}", exc_info=True)
+            await status_msg.edit_text(f"⚠️ ስህተት (Error): {str(e)[:150]}")
+        return
+
+    # CASE 3: Single TikTok Video URL
     if q_type == "video_url":
         url = query_info["url"]
         count = query_info.get("count")
         creator = query_info.get("creator")
 
-        # If user explicitly appended a count (e.g. "<url> 5" or "<url> 1")
         if count is not None:
             if count == 1:
                 status_msg = await update.message.reply_text("⏳ ቪዲዮውን በመቀበል ላይ... *(Starting...)*")
@@ -391,8 +521,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         SESSION_DATA[f"vid_{session_id}"] = url
 
         keyboard = build_count_keyboard(target_creator, is_from_video=True, session_id=session_id)
-
         creator_display = f"@{target_creator}" if not target_creator.startswith("@") else target_creator
+
         await update.message.reply_text(
             f"🎬 **የቲክቶክ ቪዲዮ ደርሶናል! (TikTok Video Link Received)**\n"
             f"👤 **ፈጣሪ (Creator):** {creator_display}\n\n"
@@ -405,7 +535,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # CASE 3: User sent a Username or Profile URL (e.g. "@adonaymada", "adonaymada", or "https://tiktok.com/@adonaymada")
+    # CASE 4: User sent a Username or Profile URL (e.g. "@adonaymada", "adonaymada", or "https://tiktok.com/@adonaymada")
     if q_type in ("username", "profile_url"):
         creator = query_info.get("creator") or query_info.get("raw", "").lstrip("@")
         count = query_info.get("count")
@@ -432,9 +562,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Unknown input
     await update.message.reply_text(
-        "⚠️ እባክዎ ትክክለኛ የቲክቶክ ቪዲዮ ሊንክ ወይም የተጠቃሚ ስም ይላኩ!\n"
-        "*(Please send a TikTok video link or @username)*\n\n"
+        "⚠️ እባክዎ ትክክለኛ የቲክቶክ ቪዲዮ ሊንክ፣ የቪዲዮ መታወቂያ (Video ID)፣ የቪዲዮ መታወቂያዎች ዝርዝር ወይም የተጠቃሚ ስም ይላኩ!\n"
+        "*(Please send a TikTok video link, video ID, list of video IDs, or @username)*\n\n"
         "ምሳሌ (Examples):\n"
+        "• `7698794225453813022` (የቪዲዮ መታወቂያ / Video ID)\n"
+        "• `7698794225453813022, 7698794225453813023` (ያልተገደበ የቪዲዮ መታወቂያዎች ዝርዝር)\n"
+        "• `7698794225453813022 5`\n"
         "• `https://vm.tiktok.com/...`\n"
         "• `https://www.tiktok.com/@user/video/...`\n"
         "• `@adonaymada`\n"
@@ -587,11 +720,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         json_str = json.dumps(batch_data, ensure_ascii=False, indent=2)
         bio = BytesIO(json_str.encode("utf-8"))
-        bio.name = f"tiktok_batch_{batch_data.get('creator', 'user')}.json"
+        creator_tag = batch_data.get('creator', 'batch')
+        bio.name = f"tiktok_batch_{creator_tag}.json"
+
+        if batch_data.get("batch_type") == "video_id_list":
+            caption_title = f"📦 **የ {batch_data.get('total_processed')} ቪዲዮ መታወቂያዎች Master JSON ባች**"
+        else:
+            caption_title = f"📦 **የ @{creator_tag} የተሟላ Master JSON ባች ({batch_data.get('total_processed')} ቪዲዮዎች)**"
 
         await query.message.reply_document(
             document=bio,
-            caption=f"📦 **የ @{batch_data.get('creator')} የተሟላ Master JSON ባች ({batch_data.get('total_processed')} ቪዲዮዎች)**",
+            caption=caption_title,
             parse_mode="Markdown"
         )
         return
@@ -685,6 +824,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("video", video_command))
+    app.add_handler(CommandHandler("id", video_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_error_handler(error_handler)
