@@ -43,7 +43,7 @@ Bot: **[@TroveTiktok_bot](https://t.me/TroveTiktok_bot)**
     7698794225453813023
     7698794225453813024
     ```
-  - The bot immediately processes each video's audio, caption, music, and Amharic transcription, then provides a **Master Batch JSON** button!
+  - The bot processes all videos smoothly and sends ONLY the final combined JSON file containing all captions and speech transcriptions directly into the chat!
 
 - **Single Video by Video ID:**
   - Send the raw Video ID: `7698794225453813022`

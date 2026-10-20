@@ -7,6 +7,7 @@ import socket
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 # Route optimization for Telegram Bot API:
@@ -160,21 +161,24 @@ async def process_single_video(
     context: ContextTypes.DEFAULT_TYPE,
     status_msg,
     video_number: int = 1,
-    total_videos: int = 1
+    total_videos: int = 1,
+    send_messages: bool = True
 ) -> Dict[str, Any]:
-    """Downloads audio track and metadata, transcribes to Amharic, and sends audio and report (No video files)."""
+    """Downloads audio track and metadata, transcribes to Amharic, and optionally sends audio and report."""
     loop = asyncio.get_running_loop()
     chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat.id
     user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else 0)
     bot = context.bot
 
     progress_prefix = f"({video_number}/{total_videos}) " if total_videos > 1 else ""
+    total_steps = 3 if send_messages else 2
 
     # Step 1: Download audio track & metadata only (NO video file)
-    await status_msg.edit_text(
-        f"⏳ **{progress_prefix}ደረጃ 1/3:** ድምፁን እና መረጃውን በማውረድ ላይ...\n*(Downloading audio track & metadata...)*",
-        parse_mode="Markdown"
-    )
+    if status_msg:
+        await status_msg.edit_text(
+            f"⏳ **{progress_prefix}ደረጃ 1/{total_steps}:** ድምፁን እና መረጃውን በማውረድ ላይ...\n*(Downloading audio track & metadata...)*",
+            parse_mode="Markdown"
+        )
 
     download_result = await loop.run_in_executor(None, download_tiktok_audio_and_meta, url)
     if not download_result.get("success"):
@@ -187,11 +191,12 @@ async def process_single_video(
 
     try:
         # Step 2: Transcribe with Gemini AI
-        await status_msg.edit_text(
-            f"🎧 **{progress_prefix}ደረጃ 2/3:** ድምፁን እና ጽሑፉን ወደ አማርኛ በመተርጎም ላይ...\n"
-            "*(Gemini AI is translating speech & caption to Amharic...)*",
-            parse_mode="Markdown"
-        )
+        if status_msg:
+            await status_msg.edit_text(
+                f"🎧 **{progress_prefix}ደረጃ 2/{total_steps}:** ድምፁን እና ጽሑፉን ወደ አማርኛ በመተርጎም ላይ...\n"
+                "*(Gemini AI is translating speech & caption to Amharic...)*",
+                parse_mode="Markdown"
+            )
 
         ai_result = await loop.run_in_executor(
             None,
@@ -228,37 +233,39 @@ async def process_single_video(
         session_id = f"{user_id}_{uuid_str()}"
         SESSION_DATA[session_id] = structured_data
 
-        # Step 4: Send Audio Track and Report Card (NO VIDEO FILE DOWNLOADED OR SENT)
-        await status_msg.edit_text(
-            f"📤 **{progress_prefix}ደረጃ 3/3:** ድምፁን እና ዝርዝር መረጃውን በመላክ ላይ...\n*(Sending audio track & report...)*",
-            parse_mode="Markdown"
-        )
-
-        # 1. Send Standalone Audio file (.mp3)
-        if audio_path and os.path.exists(audio_path) and audio_path.endswith(".mp3"):
-            music_meta = structured_data.get("music", {})
-            with open(audio_path, "rb") as af:
-                await bot.send_audio(
-                    chat_id=chat_id,
-                    audio=af,
-                    title=music_meta.get("title") or "TikTok Audio",
-                    performer=music_meta.get("artist") or structured_data['creator'],
-                    caption="🎵 **የቪዲዮው ድምፅ (Standalone Audio Track)**",
+        # Step 4: Send Audio Track and Report Card only if send_messages is True
+        if send_messages:
+            if status_msg:
+                await status_msg.edit_text(
+                    f"📤 **{progress_prefix}ደረጃ 3/3:** ድምፁን እና ዝርዝር መረጃውን በመላክ ላይ...\n*(Sending audio track & report...)*",
                     parse_mode="Markdown"
                 )
 
-        # 2. Send Formatted Info Card
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 ሙሉ JSON ዳታ አውርድ (Get Raw JSON)", callback_data=f"json_{session_id}")]
-        ])
+            # 1. Send Standalone Audio file (.mp3)
+            if audio_path and os.path.exists(audio_path) and audio_path.endswith(".mp3"):
+                music_meta = structured_data.get("music", {})
+                with open(audio_path, "rb") as af:
+                    await bot.send_audio(
+                        chat_id=chat_id,
+                        audio=af,
+                        title=music_meta.get("title") or "TikTok Audio",
+                        performer=music_meta.get("artist") or structured_data['creator'],
+                        caption="🎵 **የቪዲዮው ድምፅ (Standalone Audio Track)**",
+                        parse_mode="Markdown"
+                    )
 
-        report_text = build_report_message(structured_data)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=report_text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
+            # 2. Send Formatted Info Card
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📦 ሙሉ JSON ዳታ አውርድ (Get Raw JSON)", callback_data=f"json_{session_id}")]
+            ])
+
+            report_text = build_report_message(structured_data)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=report_text,
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
 
         return structured_data
 
@@ -350,7 +357,8 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_batch_processing_video_ids(update: Update, context: ContextTypes.DEFAULT_TYPE, video_ids: List[str]):
     """
     Processes an arbitrary list of TikTok Video IDs (unlimited).
-    Downloads audio and metadata for each ID sequentially without downloading video files.
+    Extracts captions and speech transcriptions for each ID silently and delivers ONLY
+    the final combined JSON file at the end.
     """
     chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat.id
     user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else 0)
@@ -363,8 +371,8 @@ async def start_batch_processing_video_ids(update: Update, context: ContextTypes
     total = len(video_ids)
     status_text = (
         f"📋 **የ {total} ቪዲዮ መታወቂያዎች ዝርዝር ደርሶናል! (List of {total} Video IDs Received)**\n"
-        f"⏳ እያንዳንዱን ድምፅ፣ መግለጫ እና የትርጉም መረጃ በማዘጋጀት ላይ...\n"
-        f"*(Processing {total} TikTok videos sequentially...)*"
+        f"⏳ እያንዳንዱን መግለጫ እና የንግግር ግልባጭ በማዘጋጀት ላይ...\n"
+        f"*(Processing {total} TikTok videos — only the final JSON file will be sent...)*"
     )
     if update.callback_query and update.callback_query.message:
         status_msg = await update.callback_query.message.reply_text(status_text, parse_mode="Markdown")
@@ -382,7 +390,8 @@ async def start_batch_processing_video_ids(update: Update, context: ContextTypes
                 context=context,
                 status_msg=status_msg,
                 video_number=idx,
-                total_videos=total
+                total_videos=total,
+                send_messages=False
             )
             all_results.append(res)
         except Exception as e:
@@ -393,27 +402,69 @@ async def start_batch_processing_video_ids(update: Update, context: ContextTypes
                 parse_mode="Markdown"
             )
 
-    # Master bundle button
-    batch_session_id = f"batch_{user_id}_{uuid_str()}"
-    SESSION_DATA[batch_session_id] = {
-        "batch_type": "video_id_list",
-        "creator": "video_ids_list",
-        "total_requested": total,
-        "total_processed": len(all_results),
-        "video_ids": video_ids,
-        "videos": all_results
+    if not all_results:
+        await status_msg.edit_text("❌ ምንም ቪዲዮዎችን ማዘጋጀት አልተቻለም (Could not process any videos).")
+        return
+
+    # Build clean combined JSON document containing captions, transcriptions, music, and stats
+    final_output = {
+        "batch_summary": {
+            "total_videos_requested": total,
+            "total_videos_processed": len(all_results),
+            "completed_at": datetime.now(timezone.utc).isoformat()
+        },
+        "videos": [
+            {
+                "video_id": item.get("video_id", ""),
+                "tiktok_url": item.get("tiktok_url", ""),
+                "creator": item.get("creator", "Unknown"),
+                "creator_handle": item.get("creator_handle", ""),
+                "duration_seconds": item.get("duration_seconds", 0),
+                "caption": {
+                    "original": item.get("native_caption", "").strip(),
+                    "amharic_translation": item.get("ai_transcription", {}).get("amharic_caption_translation", "").strip()
+                },
+                "transcription": {
+                    "original_language": item.get("ai_transcription", {}).get("original_language", "Unknown"),
+                    "original_speech": item.get("ai_transcription", {}).get("original_transcript", "").strip(),
+                    "amharic_transcript": item.get("ai_transcription", {}).get("amharic_transcript", "").strip(),
+                    "amharic_summary": item.get("ai_transcription", {}).get("amharic_summary", "").strip(),
+                    "amharic_key_points": item.get("ai_transcription", {}).get("amharic_key_points", [])
+                },
+                "background_music": {
+                    "sound_name": item.get("music", {}).get("title", ""),
+                    "artist": item.get("music", {}).get("artist", ""),
+                    "sound_type": item.get("music", {}).get("sound_type", ""),
+                    "vibe": item.get("ai_transcription", {}).get("sound_analysis", {}).get("sound_vibe", "")
+                },
+                "hashtags": item.get("hashtags", []),
+                "stats": item.get("stats", {})
+            }
+            for item in all_results
+        ]
     }
 
-    master_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 የተሟላ Master JSON ባች አውርድ (Download Master JSON)", callback_data=f"master_{batch_session_id}")]
-    ])
+    json_str = json.dumps(final_output, ensure_ascii=False, indent=2)
+    bio = BytesIO(json_str.encode("utf-8"))
+    bio.name = f"tiktok_transcriptions_{len(all_results)}_videos.json"
 
-    await status_msg.edit_text(
-        f"🎉 **ተጠናቋል!** ከ **{total}** ቪዲዮዎች ውስጥ **{len(all_results)}** በተሳካ ሁኔታ ተጠናቀዋል!\n"
-        f"*(Successfully finished {len(all_results)} of {total} video IDs!)*",
-        parse_mode="Markdown",
-        reply_markup=master_keyboard
+    # Send ONLY the final JSON document to the chat
+    await bot.send_document(
+        chat_id=chat_id,
+        document=bio,
+        caption=(
+            f"📦 **የ {len(all_results)} ቪዲዮዎች መግለጫ እና ግልባጭ JSON ፋይል!**\n\n"
+            f"• **የቪዲዮ ብዛት:** {len(all_results)}/{total}\n"
+            f"• **የተካተቱ መረጃዎች:** የመጀመሪያው እና የተተረጎመው መግለጫ (Caption)፣ ሙሉ የአማርኛ ንግግር ግልባጭ (Transcription)፣ ማጠቃለያ እና የጀርባ ሙዚቃ/ቫይብ።"
+        ),
+        parse_mode="Markdown"
     )
+
+    # Clean up status message
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = None):
     """Handles single video links, video IDs, lists of unlimited video IDs, creator usernames, and custom numeric counts."""
